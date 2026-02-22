@@ -1,0 +1,63 @@
+services:
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - default
+
+  frontend:
+    build:
+      context: ./mco-frontend
+      dockerfile: Dockerfile
+    container_name: mco-frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    networks:
+      - default
+    environment:
+      - VITE_API_URL=http://localhost:8080
+
+  backend:
+    build:
+      context: ./mco-backend
+      dockerfile: Dockerfile
+    container_name: mco-backend
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+    networks:
+      - default
+    env_file:
+      - ./mco-backend/app/.env
+    environment:
+      - REDIS_URL=redis://redis:6379
+
+  backgroundjob:
+    build:
+      context: ./mco-backgroundjob
+      dockerfile: Dockerfile
+    container_name: mco-backgroundjob
+    depends_on:
+      - redis
+    networks:
+      - default
+    env_file:
+      - ./mco-backgroundjob/.env
+    environment:
+      - REDIS_ADDR=redis:6379
+
+volumes:
+  postgres_data:
+  redis_data:
+
+
+networks:
+  default:
+    driver: bridge
