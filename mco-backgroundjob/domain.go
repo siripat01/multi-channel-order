@@ -10,18 +10,18 @@ import (
 type Channel string
 
 const (
-	ChannelShopee Channel = "shopee"
-	ChannelLazada Channel = "lazada"
-	ChannelLINE   Channel = "line"
+	ChannelShopee Channel = "Shopee"
+	ChannelLazada Channel = "Lazada"
+	ChannelLINE   Channel = "LINE Shopping"
 )
 
 func ParseChannel(value string) (Channel, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case string(ChannelShopee):
+	case "shopee":
 		return ChannelShopee, nil
-	case string(ChannelLazada):
+	case "lazada":
 		return ChannelLazada, nil
-	case "line shopping", "line_shopping", string(ChannelLINE):
+	case "line", "line shopping", "line_shopping":
 		return ChannelLINE, nil
 	default:
 		return "", fmt.Errorf("unsupported order channel %q", value)
