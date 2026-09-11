@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main, portfolio-hardening]
+  pull_request:
+
+jobs:
+  worker:
+    name: Go worker
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mco-backgroundjob
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.6'
+          cache-dependency-path: mco-backgroundjob/go.sum
+      - name: Test
+        run: go test ./...
+      - name: Vet
+        run: go vet ./...
+
+  frontend:
+    name: React frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mco-frontend/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        run: npm install
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+
+  backend:
+    name: Bun backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Detect recoverable backend source
+        id: backend_source
+        shell: bash
+        run: |
+          if [ -f mco-backend/app/package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::mco-backend/app is currently an unresolved gitlink; restore the original backend source before enabling backend CI."
+          fi
+      - name: Install backend dependencies
+        if: steps.backend_source.outputs.present == 'true'
+        working-directory: mco-backend/app
+        run: bun install --frozen-lockfile || bun install
+      - name: Typecheck backend
+        if: steps.backend_source.outputs.present == 'true'
+        working-directory: mco-backend/app
+        shell: bash
+        run: |
+          if bun run | grep -q "typecheck"; then
+            bun run typecheck
+          else
+            echo "No backend typecheck script defined yet"
+          fi
+      - name: Test backend
+        if: steps.backend_source.outputs.present == 'true'
+        working-directory: mco-backend/app
+        shell: bash
+        run: |
+          if bun run | grep -q "test"; then
+            bun test
+          else
+            echo "No backend test script defined yet"
+          fi

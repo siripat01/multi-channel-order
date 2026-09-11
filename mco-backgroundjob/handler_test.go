@@ -3,93 +3,159 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
+	"io"
+	"log/slog"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
-	"github.com/siripat01/order-sync/internal"
 )
 
-// To test the handler in isolation without hitting the real Shopee API,
-// we can use httptest to mock the server.
-// Note: In production, the URL is hardcoded. For testing, we might want to
-// make it configurable. But we can also use a custom http.Client or
-// global transport override if needed.
+type fakeProvider struct {
+	channel Channel
+	orders  []ExternalOrder
+}
 
-func TestNewOrderSyncHandler(t *testing.T) {
-	internal.InitializeSupabaseClient()
-	// 1. Setup a mock server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Verify query parameters
-		if r.URL.Query().Get("shop_id") != "ad27896f-444f-4d7e-b737-0f78c0ba75b5" {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-
-		fmt.Fprintln(w, `{"data": {"order_list": []}}`)
-	}))
-	defer server.Close()
-
-	// 2. Prepare the payload
-	payload := SyncOrderPayload{
-		UserId:   "e4f82e53-d3fc-408f-b1c0-bac74d832847",
-		Channel:  "Shopee",
-		ShopId:   "ad27896f-444f-4d7e-b737-0f78c0ba75b5",
-		TimeFrom: "12345678",
-		TimeTo:   "87654321",
+func (f *fakeProvider) Channel() Channel { return f.channel }
+func (f *fakeProvider) ListOrderIDs(context.Context, ListOrdersRequest) ([]string, error) {
+	ids := make([]string, 0, len(f.orders))
+	for _, order := range f.orders {
+		ids = append(ids, order.ExternalOrderID)
 	}
-	payloadBytes, _ := json.Marshal(payload)
+	return ids, nil
+}
+func (f *fakeProvider) GetOrders(context.Context, string, []string) ([]ExternalOrder, error) {
+	return f.orders, nil
+}
 
-	// 3. Create a mock task
-	task := asynq.NewTask("order:sync", payloadBytes)
+type fakeRepository struct {
+	orders map[string]Order
+	items  map[string]OrderItem
+}
 
-	// 4. Override the URL using t.Setenv for the test
-	t.Setenv("SHOPEE_BASE_URL", server.URL)
+func newFakeRepository() *fakeRepository {
+	return &fakeRepository{
+		orders: map[string]Order{},
+		items:  map[string]OrderItem{},
+	}
+}
 
-	ctx := context.Background()
+func (r *fakeRepository) UpsertOrders(_ context.Context, orders []Order, items []OrderItem) error {
+	for _, order := range orders {
+		key := order.ShopID.String() + ":" + order.Channel + ":" + order.ExternalOrderID
+		r.orders[key] = order
+	}
+	for _, item := range items {
+		key := item.OrderID + ":" + item.SourceItemKey
+		r.items[key] = item
+	}
+	return nil
+}
 
-	// 5. Execute the handler
-	err := NewOrderSyncHandler(ctx, task)
-
+func TestOrderSyncHandlerIsRetrySafe(t *testing.T) {
+	provider := &fakeProvider{
+		channel: ChannelShopee,
+		orders: []ExternalOrder{{
+			ExternalOrderID: "ORDER-123",
+			Status:          "READY_TO_SHIP",
+			CustomerName:    "customer",
+			TotalPrice:      100,
+			Currency:        "THB",
+			Items: []ExternalOrderItem{{
+				SourceKey: "item:1",
+				SKU:       "SKU-1",
+				Name:      "Item 1",
+				Quantity:  1,
+				Price:     100,
+			}},
+		}},
+	}
+	repository := newFakeRepository()
+	handler, err := NewOrderSyncTaskHandler(
+		[]OrderProvider{provider},
+		repository,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
 	if err != nil {
-		t.Fatalf("Handler failed: %v", err)
+		t.Fatalf("create handler: %v", err)
 	}
-}
 
-func BenchmarkProcessOrdersV1(b *testing.B) {
-	orders, details, userId, shopId := setupBenchmarkData(100)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		ProcessOrdersV1(orders, details, userId, shopId, "Shopee")
+	payload, _ := json.Marshal(SyncOrderPayload{
+		UserID:   uuid.NewString(),
+		ShopID:   uuid.NewString(),
+		Channel:  "Shopee",
+		TimeFrom: "100",
+		TimeTo:   "200",
+	})
+	task := asynq.NewTask("order:sync", payload)
+
+	if err := handler.Handle(context.Background(), task); err != nil {
+		t.Fatalf("first sync failed: %v", err)
 	}
-}
-
-func BenchmarkProcessOrdersV2(b *testing.B) {
-	orders, details, userId, shopId := setupBenchmarkData(100)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		ProcessOrdersV2(orders, details, userId, shopId, "Shopee")
+	var firstOrderID uuid.UUID
+	for _, order := range repository.orders {
+		firstOrderID = order.ID
 	}
-}
 
-func setupBenchmarkData(n int) ([]ShopeeOrder, []ShopeeOrder, uuid.UUID, uuid.UUID) {
-	userId := uuid.New()
-	shopId := uuid.New()
-	orders := make([]ShopeeOrder, n)
-	details := make([]ShopeeOrder, n)
-
-	for i := 0; i < n; i++ {
-		sn := fmt.Sprintf("SN-%d", i)
-		orders[i] = ShopeeOrder{OrderSn: sn, BuyerUsername: "user"}
-		details[i] = ShopeeOrder{
-			OrderSn: sn,
-			ItemList: []ShopeeOrderItem{
-				{ItemName: "Item 1", ItemSku: "SKU-1", ModelQuantityPurchased: 1, ModelOriginalPrice: 100},
-			},
+	if err := handler.Handle(context.Background(), task); err != nil {
+		t.Fatalf("retry sync failed: %v", err)
+	}
+	if len(repository.orders) != 1 {
+		t.Fatalf("expected one logical order after retry, got %d", len(repository.orders))
+	}
+	if len(repository.items) != 1 {
+		t.Fatalf("expected one logical order item after retry, got %d", len(repository.items))
+	}
+	for _, order := range repository.orders {
+		if order.ID != firstOrderID {
+			t.Fatalf("expected stable order id %s, got %s", firstOrderID, order.ID)
 		}
 	}
-	return orders, details, userId, shopId
+}
+
+func TestOrderSyncHandlerRejectsInvalidShopID(t *testing.T) {
+	repository := newFakeRepository()
+	handler, err := NewOrderSyncTaskHandler(
+		[]OrderProvider{&fakeProvider{channel: ChannelShopee}},
+		repository,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err != nil {
+		t.Fatalf("create handler: %v", err)
+	}
+
+	payload, _ := json.Marshal(SyncOrderPayload{
+		UserID:  uuid.NewString(),
+		ShopID:  "not-a-uuid",
+		Channel: "Shopee",
+	})
+
+	if err := handler.Handle(context.Background(), asynq.NewTask("order:sync", payload)); err == nil {
+		t.Fatal("expected invalid shop id to return an error")
+	}
+}
+
+func TestBuildOrdersUsesDeterministicIdentifiers(t *testing.T) {
+	userID := uuid.New()
+	shopID := uuid.New()
+	external := []ExternalOrder{{
+		ExternalOrderID: "ORDER-123",
+		Items:           []ExternalOrderItem{{SourceKey: "item:1"}},
+	}}
+
+	first, firstItems, err := BuildOrders(userID, shopID, ChannelShopee, external)
+	if err != nil {
+		t.Fatalf("build first order: %v", err)
+	}
+	second, secondItems, err := BuildOrders(userID, shopID, ChannelShopee, external)
+	if err != nil {
+		t.Fatalf("build second order: %v", err)
+	}
+
+	if first[0].ID != second[0].ID {
+		t.Fatalf("order id changed across retries: %s != %s", first[0].ID, second[0].ID)
+	}
+	if firstItems[0].SourceItemKey != secondItems[0].SourceItemKey {
+		t.Fatal("source item key changed across retries")
+	}
 }

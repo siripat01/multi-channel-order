@@ -1,19 +1,29 @@
-import { useState, useEffect } from "react";
-import { Plug, CheckCircle2, RefreshCw, Store, ExternalLink } from "lucide-react";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
-import { Badge } from "../components/ui/badge";
-import { toast } from "sonner";
+import { useEffect, useState } from "react";
+import { CheckCircle2, ExternalLink, Plug, RefreshCw, Store } from "lucide-react";
 import { useNavigate } from "react-router";
-import { API_BASE_URL } from "../../config";
+import { toast } from "sonner";
+import { Badge } from "../components/ui/badge";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
+import { apiRequest, type ApiResponse } from "../../lib/api";
 
-interface IntegrationRecord {
+type ShopSummary = {
+  id: string;
+  shop_name: string;
+};
+
+type IntegrationApiRecord = {
   id: string;
   shop_id: string;
   channel: string;
   external_shop_id: string;
-  last_sync_at: string;
-  shop_name?: string;
-}
+  last_sync_at?: string | null;
+  last_synced_at?: string | null;
+};
+
+type IntegrationRecord = IntegrationApiRecord & {
+  shop_name: string;
+  last_synced: string | null;
+};
 
 export function IntegrationsPage() {
   const navigate = useNavigate();
@@ -21,42 +31,31 @@ export function IntegrationsPage() {
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    fetchAllIntegrations();
+    void fetchAllIntegrations();
   }, []);
 
   const fetchAllIntegrations = async () => {
-    const sessionStr = localStorage.getItem("auth_session");
-    if (!sessionStr) return;
-    const { session } = JSON.parse(sessionStr);
-    const accessToken = session?.access_token;
-    if (!accessToken) return;
-
+    setIsLoading(true);
     try {
-      // 1. Fetch all shops for this user - call new /shops endpoint
-      const shopsResponse = await fetch(`${API_BASE_URL}/shops`, {
-        headers: { "Authorization": `Bearer ${accessToken}` }
-      });
-      const shopsResult = await shopsResponse.json();
-      const userShops = shopsResult.data || [];
+      const shopsResult = await apiRequest<ApiResponse<ShopSummary[]>>("/shops");
+      const userShops = shopsResult.data ?? [];
 
-      // 2. Fetch integrations for each shop
-      const allIntegrations: IntegrationRecord[] = [];
-      for (const shop of userShops) {
-        const intResponse = await fetch(`${API_BASE_URL}/integrations/shop/${shop.id}`, {
-          headers: { "Authorization": `Bearer ${accessToken}` }
-        });
-        const intResult = await intResponse.json();
-        if (intResult.data) {
-          intResult.data.forEach((int: any) => {
-            allIntegrations.push({
-              ...int,
-              shop_name: shop.shop_name
-            });
-          });
-        }
-      }
-      setIntegrations(allIntegrations);
-    } catch (error) {
+      const integrationGroups = await Promise.all(
+        userShops.map(async (shop) => {
+          const result = await apiRequest<ApiResponse<IntegrationApiRecord[]>>(
+            `/integrations/shop/${shop.id}`,
+          );
+
+          return (result.data ?? []).map((integration) => ({
+            ...integration,
+            shop_name: shop.shop_name,
+            last_synced: integration.last_synced_at ?? integration.last_sync_at ?? null,
+          }));
+        }),
+      );
+
+      setIntegrations(integrationGroups.flat());
+    } catch {
       toast.error("An error occurred while fetching integrations overview");
     } finally {
       setIsLoading(false);
@@ -67,15 +66,13 @@ export function IntegrationsPage() {
     <div className="p-8">
       <div className="mb-8">
         <h1 className="mb-2 text-3xl font-bold">Integrations Overview</h1>
-        <p className="text-muted-foreground">
-          Monitor all active connections across your shops
-        </p>
+        <p className="text-muted-foreground">Monitor all active connections across your shops</p>
       </div>
 
       {isLoading ? (
         <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
-          {[1, 2, 3].map((i) => (
-            <Card key={i} className="animate-pulse">
+          {[1, 2, 3].map((item) => (
+            <Card key={item} className="animate-pulse">
               <div className="h-40 bg-muted" />
             </Card>
           ))}
@@ -86,9 +83,7 @@ export function IntegrationsPage() {
             <Plug className="h-8 w-8 text-muted-foreground" />
           </div>
           <CardTitle className="mb-2">No active integrations</CardTitle>
-          <CardDescription className="mb-6">
-            Go to your shops to connect them with Shopee, Lazada, or other channels.
-          </CardDescription>
+          <CardDescription className="mb-6">Go to your shops to connect an implemented channel.</CardDescription>
           <button
             onClick={() => navigate("/shops")}
             className="rounded-md bg-primary px-4 py-2 text-primary-foreground hover:bg-primary/90"
@@ -129,8 +124,8 @@ export function IntegrationsPage() {
                   <div className="flex justify-between">
                     <span className="text-muted-foreground">Last Sync:</span>
                     <span>
-                      {integration.last_sync_at
-                        ? new Date(integration.last_sync_at).toLocaleDateString()
+                      {integration.last_synced
+                        ? new Date(integration.last_synced).toLocaleDateString()
                         : "Pending..."}
                     </span>
                   </div>
@@ -143,7 +138,11 @@ export function IntegrationsPage() {
                     <ExternalLink className="h-4 w-4" />
                     Manage
                   </button>
-                  <button className="flex flex-1 items-center justify-center gap-2 rounded-md border border-input bg-background px-3 py-1.5 text-sm font-medium hover:bg-accent hover:text-accent-foreground">
+                  <button
+                    disabled
+                    title="Sync endpoint not wired yet"
+                    className="flex flex-1 cursor-not-allowed items-center justify-center gap-2 rounded-md border border-input bg-background px-3 py-1.5 text-sm font-medium opacity-60"
+                  >
                     <RefreshCw className="h-4 w-4" />
                     Sync
                   </button>
