@@ -4,166 +4,115 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"os"
-	"strings"
+	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
-	"github.com/siripat01/order-sync/internal"
 )
 
-var ShopeeBaseURL = "https://d14452c0-14dd-48ba-b5c0-fc4efc3147a3.mock.pstmn.io"
-
-func init() {
-	if envUrl := os.Getenv("SHOPEE_BASE_URL"); envUrl != "" {
-		ShopeeBaseURL = envUrl
-	}
+type OrderSyncTaskHandler struct {
+	providers map[Channel]OrderProvider
+	repository OrderRepository
+	logger     *slog.Logger
 }
 
-// ProcessOrdersV1 uses a map for O(1) lookup of items
-func ProcessOrdersV1(orders []ShopeeOrder, details []ShopeeOrder, userId, shopId uuid.UUID, channel string) ([]Order, []OrderItem) {
-	var ordersToInsert []Order
-	var itemsToInsert []OrderItem
-
-	detailMap := make(map[string][]ShopeeOrderItem)
-	for _, d := range details {
-		detailMap[d.OrderSn] = d.ItemList
+func NewOrderSyncTaskHandler(providers []OrderProvider, repository OrderRepository, logger *slog.Logger) (*OrderSyncTaskHandler, error) {
+	if repository == nil {
+		return nil, fmt.Errorf("order repository is required")
+	}
+	if logger == nil {
+		logger = slog.Default()
 	}
 
-	for _, o := range orders {
-		newOrderId := uuid.New()
-		ordersToInsert = append(ordersToInsert, Order{
-			Id:              newOrderId,
-			UserId:          userId,
-			ShopId:          shopId,
-			Channel:         channel,
-			ExternalOrderId: o.OrderSn,
-			Status:          o.OrderStatus,
-			CustomerName:    o.BuyerUsername,
-			CustomerAddress: o.RecipientAddress.FullAddress,
-			CustomerPhone:   o.RecipientAddress.Phone,
-			TotalPrice:      o.TotalAmount,
-			Currency:        "THB",
-		})
-
-		if items, ok := detailMap[o.OrderSn]; ok {
-			for _, item := range items {
-				itemsToInsert = append(itemsToInsert, OrderItem{
-					OrderId:  newOrderId.String(),
-					Sku:      item.ItemSku,
-					Name:     item.ItemName,
-					Quantity: item.ModelQuantityPurchased,
-					Price:    item.ModelOriginalPrice,
-				})
-			}
+	providerMap := make(map[Channel]OrderProvider, len(providers))
+	for _, provider := range providers {
+		if provider == nil {
+			continue
 		}
+		providerMap[provider.Channel()] = provider
 	}
-	return ordersToInsert, itemsToInsert
+	if len(providerMap) == 0 {
+		return nil, fmt.Errorf("at least one order provider is required")
+	}
+
+	return &OrderSyncTaskHandler{
+		providers:  providerMap,
+		repository: repository,
+		logger:     logger,
+	}, nil
 }
 
-// ProcessOrdersV2 uses nested loops for lookup (O(N*M)) - slower for demonstration
-func ProcessOrdersV2(orders []ShopeeOrder, details []ShopeeOrder, userId, shopId uuid.UUID, channel string) ([]Order, []OrderItem) {
-	var ordersToInsert []Order
-	var itemsToInsert []OrderItem
+func (h *OrderSyncTaskHandler) Handle(ctx context.Context, task *asynq.Task) error {
+	startedAt := time.Now()
 
-	for _, o := range orders {
-		newOrderId := uuid.New()
-		ordersToInsert = append(ordersToInsert, Order{
-			Id:              newOrderId,
-			UserId:          userId,
-			ShopId:          shopId,
-			Channel:         channel,
-			ExternalOrderId: o.OrderSn,
-			Status:          o.OrderStatus,
-			CustomerName:    o.BuyerUsername,
-			CustomerAddress: o.RecipientAddress.FullAddress,
-			CustomerPhone:   o.RecipientAddress.Phone,
-			TotalPrice:      o.TotalAmount,
-			Currency:        "THB",
-		})
-
-		// Nested loop search - intentionally inefficient for benchmark comparison
-		for _, d := range details {
-			if d.OrderSn == o.OrderSn {
-				for _, item := range d.ItemList {
-					itemsToInsert = append(itemsToInsert, OrderItem{
-						OrderId:  newOrderId.String(),
-						Sku:      item.ItemSku,
-						Name:     item.ItemName,
-						Quantity: item.ModelQuantityPurchased,
-						Price:    item.ModelOriginalPrice,
-					})
-				}
-				break
-			}
-		}
-	}
-	return ordersToInsert, itemsToInsert
-}
-
-func NewOrderSyncHandler(ctx context.Context, t *asynq.Task) error {
-	var p SyncOrderPayload
-	if err := json.Unmarshal(t.Payload(), &p); err != nil {
-		return err
+	var payload SyncOrderPayload
+	if err := json.Unmarshal(task.Payload(), &payload); err != nil {
+		return fmt.Errorf("decode order sync payload: %w", err)
 	}
 
-	userId, _ := uuid.Parse(p.UserId)
-	shopId, _ := uuid.Parse(p.ShopId)
-
-	url := fmt.Sprintf("%s/api/v2/order/get_order_list?shop_id=%s&time_from=%s&time_to=%s&page_size=20",
-		ShopeeBaseURL, p.ShopId, p.TimeFrom, p.TimeTo)
-
-	resp, err := http.Get(url)
+	userID, err := uuid.Parse(payload.UserID)
+	if err != nil {
+		return fmt.Errorf("parse user_id %q: %w", payload.UserID, err)
+	}
+	shopID, err := uuid.Parse(payload.ShopID)
+	if err != nil {
+		return fmt.Errorf("parse shop_id %q: %w", payload.ShopID, err)
+	}
+	channel, err := ParseChannel(payload.Channel)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
 
-	var shopeeResponse ShopeeResponse
-	if err := json.NewDecoder(resp.Body).Decode(&shopeeResponse); err != nil {
-		return err
+	provider, ok := h.providers[channel]
+	if !ok {
+		return fmt.Errorf("channel %q is recognized but no provider adapter is configured", channel)
 	}
 
-	if len(shopeeResponse.Data.OrderList) == 0 {
+	h.logger.InfoContext(ctx, "order sync started",
+		"provider", channel,
+		"shop_id", shopID.String(),
+		"task_type", task.Type(),
+	)
+
+	orderIDs, err := provider.ListOrderIDs(ctx, ListOrdersRequest{
+		ShopID:   payload.ShopID,
+		TimeFrom: payload.TimeFrom,
+		TimeTo:   payload.TimeTo,
+	})
+	if err != nil {
+		return fmt.Errorf("list %s orders for shop %s: %w", channel, shopID, err)
+	}
+	if len(orderIDs) == 0 {
+		h.logger.InfoContext(ctx, "order sync completed",
+			"provider", channel,
+			"shop_id", shopID.String(),
+			"orders", 0,
+			"duration_ms", time.Since(startedAt).Milliseconds(),
+		)
 		return nil
 	}
 
-	var orderSns []string
-	for _, o := range shopeeResponse.Data.OrderList {
-		orderSns = append(orderSns, o.OrderSn)
-	}
-
-	detailUrl := fmt.Sprintf("%s/api/v2/order/get_order_detail?shop_id=%s&order_sn_list=%s",
-		ShopeeBaseURL, p.ShopId, strings.Join(orderSns, ","))
-
-	detailResp, err := http.Get(detailUrl)
+	externalOrders, err := provider.GetOrders(ctx, payload.ShopID, orderIDs)
 	if err != nil {
-		return err
-	}
-	defer detailResp.Body.Close()
-
-	var orderDetailResponse ShopeeOrderDetail
-	if err := json.NewDecoder(detailResp.Body).Decode(&orderDetailResponse); err != nil {
-		return err
+		return fmt.Errorf("get %s order details for shop %s: %w", channel, shopID, err)
 	}
 
-	ordersToInsert, itemsToInsert := ProcessOrdersV1(shopeeResponse.Data.OrderList, orderDetailResponse.Data.OrderList, userId, shopId, p.Channel)
-
-	supabaseClient := internal.GetSupabaseClient()
-	if len(ordersToInsert) > 0 {
-		_, _, err = supabaseClient.From("orders").Insert(ordersToInsert, false, "", "", "").Execute()
-		if err != nil {
-			return err
-		}
+	orders, items, err := BuildOrders(userID, shopID, channel, externalOrders)
+	if err != nil {
+		return fmt.Errorf("normalize %s orders: %w", channel, err)
 	}
 
-	if len(itemsToInsert) > 0 {
-		_, _, err = supabaseClient.From("order_items").Insert(itemsToInsert, false, "", "", "").Execute()
-		if err != nil {
-			return err
-		}
+	if err := h.repository.UpsertOrders(ctx, orders, items); err != nil {
+		return fmt.Errorf("persist %s orders for shop %s: %w", channel, shopID, err)
 	}
 
+	h.logger.InfoContext(ctx, "order sync completed",
+		"provider", channel,
+		"shop_id", shopID.String(),
+		"orders", len(orders),
+		"items", len(items),
+		"duration_ms", time.Since(startedAt).Milliseconds(),
+	)
 	return nil
 }
