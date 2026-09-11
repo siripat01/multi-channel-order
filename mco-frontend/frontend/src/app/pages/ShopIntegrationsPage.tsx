@@ -1,62 +1,76 @@
-import { useState, useEffect } from "react";
-import { useParams, useNavigate } from "react-router";
-import { Plug, CheckCircle2, XCircle, RefreshCw, ArrowLeft, Store, AlertCircle } from "lucide-react";
+import { useEffect, useState } from "react";
+import { useNavigate, useParams } from "react-router";
+import { AlertCircle, ArrowLeft, CheckCircle2, Plug, RefreshCw, Store, XCircle } from "lucide-react";
+import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
-import { Badge } from "../components/ui/badge";
 import { toast } from "sonner";
-import { API_BASE_URL } from "../../config";
+import { SHOPEE_MOCK_BASE_URL } from "../../config";
+import { apiRequest, type ApiResponse } from "../../lib/api";
 
-interface Integration {
+type IntegrationRecord = {
   id: string;
   channel: string;
   external_shop_id: string;
-  last_synced_at: string;
-}
+  last_synced_at?: string | null;
+  last_sync_at?: string | null;
+};
 
-interface Shop {
+type Shop = {
   id: string;
   shop_name: string;
+};
+
+type ShopeeMockAuthResponse = {
+  code: string;
+};
+
+type ShopeeMockTokenResponse = {
+  data: {
+    shop_id: string | number;
+    access_token: string;
+    refresh_token: string;
+  };
+};
+
+const channels = [
+  { name: "Shopee", implemented: true, color: "bg-orange-100 text-orange-600" },
+  { name: "Lazada", implemented: false, color: "bg-blue-100 text-blue-600" },
+  { name: "LINE Shopping", implemented: false, color: "bg-green-100 text-green-600" },
+] as const;
+
+function getLastSyncAt(integration: IntegrationRecord): string | null {
+  return integration.last_synced_at ?? integration.last_sync_at ?? null;
 }
 
 export function ShopIntegrationsPage() {
   const { shopId } = useParams();
   const navigate = useNavigate();
   const [shop, setShop] = useState<Shop | null>(null);
-  const [integrations, setIntegrations] = useState<Integration[]>([]);
+  const [integrations, setIntegrations] = useState<IntegrationRecord[]>([]);
   const [isFetching, setIsFetching] = useState(true);
 
   useEffect(() => {
-    fetchData();
+    void fetchData();
   }, [shopId]);
 
   const fetchData = async () => {
-    if (!shopId) return;
+    if (!shopId) {
+      setIsFetching(false);
+      return;
+    }
 
-    const sessionStr = localStorage.getItem("auth_session");
-    if (!sessionStr) return;
-    const { session } = JSON.parse(sessionStr);
-    const accessToken = session?.access_token;
-    if (!accessToken) return;
-
+    setIsFetching(true);
     try {
-      // Fetch Shop details - call new /shops endpoint (GET for current user)
-      const shopResponse = await fetch(`${API_BASE_URL}/shops`, {
-        headers: { "Authorization": `Bearer ${accessToken}` }
-      });
-      const shopsResult = await shopResponse.json();
-      const currentShop = shopsResult.data?.find((s: any) => s.id === shopId);
-      setShop(currentShop || null);
+      const [shopsResult, integrationResult] = await Promise.all([
+        apiRequest<ApiResponse<Shop[]>>("/shops"),
+        apiRequest<ApiResponse<IntegrationRecord[]>>(`/integrations/shop/${shopId}`),
+      ]);
 
-      console.log(currentShop);
-
-      // Fetch Integrations
-      const integrationResponse = await fetch(`${API_BASE_URL}/integrations/shop/${shopId}`);
-      const integrationResult = await integrationResponse.json();
-      console.log(integrationResult);
-
-      setIntegrations(integrationResult.data || []);
-    } catch (error) {
+      const currentShop = (shopsResult.data ?? []).find((candidate) => candidate.id === shopId) ?? null;
+      setShop(currentShop);
+      setIntegrations(integrationResult.data ?? []);
+    } catch {
       toast.error("Failed to fetch integration data");
     } finally {
       setIsFetching(false);
@@ -64,93 +78,69 @@ export function ShopIntegrationsPage() {
   };
 
   const handleConnect = async (channel: string) => {
-    const sessionStr = localStorage.getItem("auth_session");
-    if (!sessionStr) return;
-    const { session } = JSON.parse(sessionStr);
-    const accessToken = session?.access_token;
-    if (!accessToken) return;
+    if (!shopId) {
+      return;
+    }
+
+    if (channel !== "Shopee") {
+      toast.info(`${channel} integration is not implemented yet`);
+      return;
+    }
 
     setIsFetching(true);
     try {
-      // ... (existing mock fetching logic)
-      const providerResponse = await fetch("https://d14452c0-14dd-48ba-b5c0-fc4efc3147a3.mock.pstmn.io/api/v2/shop/auth_partner?partner_id=1000001&redirect=http://localhost:5173",
-        {
-          method: "GET",
-          headers: { "Content-Type": "application/json" },
-        }
-      )
-      const providerResult = await providerResponse.json()
+      const providerResponse = await fetch(
+        `${SHOPEE_MOCK_BASE_URL}/api/v2/shop/auth_partner?partner_id=1000001&redirect=http://localhost:5173`,
+        { headers: { "Content-Type": "application/json" } },
+      );
+      if (!providerResponse.ok) {
+        throw new Error(`Shopee mock auth failed with HTTP ${providerResponse.status}`);
+      }
 
-      const getAccessToken = await fetch("https://d14452c0-14dd-48ba-b5c0-fc4efc3147a3.mock.pstmn.io/api/v2/auth/token/get",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            code: providerResult.code,
-            partner_id: "1000001",
-            shop_id: "123456",
-          }),
-        }
-      )
-
-      const getAccessTokenResult = await getAccessToken.json()
-
-      const response = await fetch(`${API_BASE_URL}/integrations`, {
+      const providerResult = (await providerResponse.json()) as ShopeeMockAuthResponse;
+      const tokenResponse = await fetch(`${SHOPEE_MOCK_BASE_URL}/api/v2/auth/token/get`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${accessToken}`
-        },
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          code: providerResult.code,
+          partner_id: "1000001",
+          shop_id: "123456",
+        }),
+      });
+      if (!tokenResponse.ok) {
+        throw new Error(`Shopee mock token exchange failed with HTTP ${tokenResponse.status}`);
+      }
+
+      const tokenResult = (await tokenResponse.json()) as ShopeeMockTokenResponse;
+      await apiRequest<ApiResponse<IntegrationRecord>>("/integrations", {
+        method: "POST",
         body: JSON.stringify({
           shop_id: shopId,
-          channel: channel,
-          external_shop_id: String(getAccessTokenResult.data.shop_id),
-          access_token: getAccessTokenResult.data.access_token,
-          refresh_token: getAccessTokenResult.data.refresh_token
+          channel,
+          external_shop_id: String(tokenResult.data.shop_id),
+          access_token: tokenResult.data.access_token,
+          refresh_token: tokenResult.data.refresh_token,
         }),
       });
 
-      if (response.ok) {
-        toast.success(`Successfully connected to ${channel}!`);
-        fetchData();
-      } else {
-        const result = await response.json();
-        toast.error(result.message || "Connection failed");
-      }
-    } catch (error) {
-      toast.error("An error occurred during connection");
+      toast.success(`Successfully connected to ${channel}`);
+      await fetchData();
+    } catch {
+      toast.error("An error occurred while connecting the provider");
     } finally {
       setIsFetching(false);
     }
   };
 
   const handleDisconnect = async (id: string, channel: string) => {
-    const sessionStr = localStorage.getItem("auth_session");
-    if (!sessionStr) return;
-    const { session } = JSON.parse(sessionStr);
-    const accessToken = session?.access_token;
-
     try {
-      const response = await fetch(`${API_BASE_URL}/integrations/${id}`, {
-        method: "DELETE",
-        headers: { "Authorization": `Bearer ${accessToken}` }
-      });
-      if (response.ok) {
-        toast.success(`${channel} disconnected successfully`);
-        fetchData();
-      } else {
-        toast.error("Failed to disconnect");
-      }
-    } catch (error) {
+      await apiRequest<unknown>(`/integrations/${id}`, { method: "DELETE" });
+      toast.success(`${channel} disconnected successfully`);
+      await fetchData();
+    } catch {
       toast.error("An error occurred during disconnection");
     }
   };
-
-  const channels = [
-    { name: "Shopee", color: "bg-orange-100 text-orange-600", icon: Plug },
-    { name: "Lazada", color: "bg-blue-100 text-blue-600", icon: Plug },
-    { name: "LINE Shopping", color: "bg-green-100 text-green-600", icon: Plug },
-  ];
 
   if (isFetching && !shop) {
     return <div className="p-8 text-center">Loading shop data...</div>;
@@ -188,8 +178,10 @@ export function ShopIntegrationsPage() {
 
       <div className="grid gap-6 md:grid-cols-2">
         {channels.map((channel) => {
-          const integration = integrations.find(i => i.channel.toLowerCase() === channel.name.toLowerCase());
-          const isConnected = !!integration;
+          const integration = integrations.find(
+            (item) => item.channel.toLowerCase() === channel.name.toLowerCase(),
+          );
+          const isConnected = Boolean(integration);
 
           return (
             <Card key={channel.name}>
@@ -197,7 +189,7 @@ export function ShopIntegrationsPage() {
                 <div className="flex items-start justify-between">
                   <div className="flex items-center gap-3">
                     <div className={`flex h-12 w-12 items-center justify-center rounded-lg ${channel.color}`}>
-                      <channel.icon className="h-6 w-6" />
+                      <Plug className="h-6 w-6" />
                     </div>
                     <div>
                       <CardTitle>{channel.name}</CardTitle>
@@ -212,13 +204,13 @@ export function ShopIntegrationsPage() {
                   ) : (
                     <Badge variant="outline" className="text-muted-foreground">
                       <XCircle className="mr-1 h-3 w-3" />
-                      Not connected
+                      {channel.implemented ? "Not connected" : "Not implemented"}
                     </Badge>
                   )}
                 </div>
               </CardHeader>
               <CardContent className="space-y-4">
-                {isConnected ? (
+                {integration ? (
                   <>
                     <div className="space-y-2 rounded-lg bg-accent p-3 text-sm">
                       <div className="flex justify-between">
@@ -228,21 +220,21 @@ export function ShopIntegrationsPage() {
                       <div className="flex justify-between">
                         <span className="text-muted-foreground">Last Sync:</span>
                         <span className="font-medium">
-                          {integration.last_synced_at
-                            ? new Date(integration.last_synced_at).toLocaleString()
+                          {getLastSyncAt(integration)
+                            ? new Date(getLastSyncAt(integration) as string).toLocaleString()
                             : "Awaiting sync..."}
                         </span>
                       </div>
                     </div>
                     <div className="flex gap-2">
-                      <Button variant="outline" className="flex-1">
+                      <Button variant="outline" className="flex-1" disabled title="Sync endpoint not wired yet">
                         <RefreshCw className="mr-2 h-4 w-4" />
                         Re-sync
                       </Button>
                       <Button
                         variant="destructive"
                         className="flex-1"
-                        onClick={() => handleDisconnect(integration.id, channel.name)}
+                        onClick={() => void handleDisconnect(integration.id, channel.name)}
                       >
                         Disconnect
                       </Button>
@@ -251,15 +243,17 @@ export function ShopIntegrationsPage() {
                 ) : (
                   <>
                     <p className="text-sm text-muted-foreground">
-                      Connect your {channel.name} account to sync orders for {shop.shop_name}.
+                      {channel.implemented
+                        ? `Connect your ${channel.name} account to sync orders for ${shop.shop_name}.`
+                        : `${channel.name} support has not been implemented yet.`}
                     </p>
                     <Button
                       className="w-full"
-                      onClick={() => handleConnect(channel.name)}
-                      disabled={isFetching}
+                      onClick={() => void handleConnect(channel.name)}
+                      disabled={isFetching || !channel.implemented}
                     >
                       <Plug className="mr-2 h-4 w-4" />
-                      Connect {channel.name}
+                      {channel.implemented ? `Connect ${channel.name}` : "Not implemented"}
                     </Button>
                   </>
                 )}

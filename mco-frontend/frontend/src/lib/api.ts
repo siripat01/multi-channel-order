@@ -1,5 +1,10 @@
 import { API_BASE_URL } from "../config";
 
+export type ApiResponse<T> = {
+  data?: T;
+  message?: string;
+};
+
 type StoredAuthSession = {
   session?: {
     access_token?: string;
