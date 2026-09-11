@@ -10,70 +10,60 @@ import { Calendar } from "../components/ui/calendar";
 import { Popover, PopoverContent, PopoverTrigger } from "../components/ui/popover";
 import { format } from "date-fns";
 import { toast } from "sonner";
-import { API_BASE_URL } from "../../config";
+import { apiRequest } from "../../lib/api";
+import {
+  type KnownOrderStatus,
+  type OrderFilter,
+  type OrderListResponse,
+  type OrderViewModel,
+  toOrderViewModel,
+} from "../../features/orders/types";
 
-// Mock data
-type OrderStatus = "all" | "new" | "packed" | "shipped";
-
-const statusColors = {
+const statusColors: Record<KnownOrderStatus, string> = {
   new: "bg-blue-100 text-blue-800",
   packed: "bg-orange-100 text-orange-800",
   shipped: "bg-green-100 text-green-800",
 };
 
+function statusClassName(status: string): string {
+  if (status === "new" || status === "packed" || status === "shipped") {
+    return statusColors[status];
+  }
+  return "bg-gray-100 text-gray-800";
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Unexpected error";
+}
+
 export function DashboardPage() {
-  const [orders, setOrders] = useState<any[]>([]);
+  const [orders, setOrders] = useState<OrderViewModel[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [selectedOrders, setSelectedOrders] = useState<Set<string>>(new Set());
-  const [statusFilter, setStatusFilter] = useState<OrderStatus>("all");
+  const [statusFilter, setStatusFilter] = useState<OrderFilter>("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [dateFilter, setDateFilter] = useState<Date | undefined>(undefined);
 
-  useEffect(() => {
-    fetchOrders();
-  }, []);
-
   const fetchOrders = async () => {
-    const sessionStr = localStorage.getItem("auth_session");
-    if (!sessionStr) return;
-    const { session } = JSON.parse(sessionStr);
-    const accessToken = session?.access_token;
-    if (!accessToken) return;
-
-    try {
-      const response = await fetch(`${API_BASE_URL}/orders`, {
-        headers: {
-          "Authorization": `Bearer ${accessToken}`
-        }
-      });
-      const result = await response.json();
-      if (response.ok) {
-        // Map database fields to UI fields
-        const formattedOrders = (result.data || []).map((o: any) => ({
-          id: o.external_order_id,
-          date: new Date(o.external_created_at || Date.now()), // Just in case external_created_at is missing
-          customer: o.customer_name,
-          amount: o.total_price,
-          status: o.status.toLowerCase() || "new",
-          db_id: o.id
-        }));
-        setOrders(formattedOrders);
-      } else {
-        toast.error(result.message || "Failed to fetch orders");
-      }
-    } catch (error) {
-      toast.error("An error occurred while fetching orders");
-    } finally {
-      setIsLoading(false);
-    }
+    const result = await apiRequest<OrderListResponse>("/orders");
+    setOrders((result.data ?? []).map(toOrderViewModel));
+    setIsLoading(false);
   };
+
+  useEffect(() => {
+    void fetchOrders().catch((error: unknown) => {
+      setIsLoading(false);
+      toast.error(`Failed to fetch orders: ${errorMessage(error)}`);
+    });
+  }, []);
 
   const filteredOrders = orders.filter((order) => {
     const matchesStatus = statusFilter === "all" || order.status === statusFilter;
+    const normalizedSearch = searchQuery.toLowerCase();
     const matchesSearch =
       searchQuery === "" ||
-      order.id.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      order.customer.toLowerCase().includes(searchQuery.toLowerCase());
+      order.id.toLowerCase().includes(normalizedSearch) ||
+      order.customer.toLowerCase().includes(normalizedSearch);
     const matchesDate = !dateFilter || format(order.date, "yyyy-MM-dd") === format(dateFilter, "yyyy-MM-dd");
 
     return matchesStatus && matchesSearch && matchesDate;
@@ -93,32 +83,27 @@ export function DashboardPage() {
     if (selectedOrders.size === filteredOrders.length) {
       setSelectedOrders(new Set());
     } else {
-      setSelectedOrders(new Set(filteredOrders.map((o) => o.id)));
+      setSelectedOrders(new Set(filteredOrders.map((order) => order.id)));
     }
   };
 
   const handleSync = async () => {
-    toast.promise(fetchOrders(), {
-      loading: 'Syncing orders...',
-      success: 'Orders synced successfully!',
-      error: 'Failed to sync orders'
+    await toast.promise(fetchOrders(), {
+      loading: "Refreshing orders...",
+      success: "Orders refreshed successfully",
+      error: (error: unknown) => `Failed to refresh orders: ${errorMessage(error)}`,
     });
   };
 
-  const handleMarkPacked = () => {
+  const handleStatusActionUnavailable = (targetStatus: KnownOrderStatus) => {
     if (selectedOrders.size === 0) {
       toast.error("Please select orders first");
       return;
     }
-    toast.success(`${selectedOrders.size} order(s) marked as packed`);
-  };
 
-  const handleMarkShipped = () => {
-    if (selectedOrders.size === 0) {
-      toast.error("Please select orders first");
-      return;
-    }
-    toast.success(`${selectedOrders.size} order(s) marked as shipped`);
+    toast.info(
+      `Mark ${targetStatus} is not wired to the API yet. The backend source must be restored before this action can be implemented safely.`,
+    );
   };
 
   const handleGenerateLabels = () => {
@@ -126,18 +111,15 @@ export function DashboardPage() {
       toast.error("Please select orders first");
       return;
     }
-    toast.success(`Generating labels for ${selectedOrders.size} order(s)`);
+    toast.info("Label generation is still a planned feature and does not download a real label yet.");
   };
 
   return (
     <div className="flex h-full flex-col">
-      {/* Header */}
       <div className="border-b border-border bg-card px-8 py-6">
         <h1 className="mb-6">Order Inbox</h1>
 
-        {/* Filters and Actions Bar */}
         <div className="flex flex-wrap items-center gap-4">
-          {/* Date Filter */}
           <Popover>
             <PopoverTrigger asChild>
               <Button variant="outline" className="w-[200px] justify-start">
@@ -154,8 +136,7 @@ export function DashboardPage() {
             </PopoverContent>
           </Popover>
 
-          {/* Status Filter */}
-          <Select value={statusFilter} onValueChange={(value) => setStatusFilter(value as OrderStatus)}>
+          <Select value={statusFilter} onValueChange={(value) => setStatusFilter(value as OrderFilter)}>
             <SelectTrigger className="w-[180px]">
               <SelectValue placeholder="Status" />
             </SelectTrigger>
@@ -167,37 +148,33 @@ export function DashboardPage() {
             </SelectContent>
           </Select>
 
-          {/* Search */}
           <div className="relative flex-1 min-w-[200px]">
             <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
             <Input
               placeholder="Search orders..."
               value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
+              onChange={(event) => setSearchQuery(event.target.value)}
               className="pl-9 bg-input-background"
             />
           </div>
 
           <div className="flex gap-2 ml-auto">
-            <Button onClick={handleSync} variant="outline">
+            <Button onClick={() => void handleSync()} variant="outline">
               <RefreshCw className="mr-2 h-4 w-4" />
-              Sync Orders
+              Refresh Orders
             </Button>
           </div>
         </div>
 
-        {/* Bulk Actions */}
         {selectedOrders.size > 0 && (
           <div className="mt-4 flex items-center gap-2 rounded-lg border border-primary/20 bg-accent p-4">
-            <span className="text-sm">
-              {selectedOrders.size} order(s) selected
-            </span>
+            <span className="text-sm">{selectedOrders.size} order(s) selected</span>
             <div className="ml-auto flex gap-2">
-              <Button onClick={handleMarkPacked} size="sm" variant="outline">
+              <Button onClick={() => handleStatusActionUnavailable("packed")} size="sm" variant="outline">
                 <PackageIcon className="mr-2 h-4 w-4" />
                 Mark Packed
               </Button>
-              <Button onClick={handleMarkShipped} size="sm" variant="outline">
+              <Button onClick={() => handleStatusActionUnavailable("shipped")} size="sm" variant="outline">
                 <PackageIcon className="mr-2 h-4 w-4" />
                 Mark Shipped
               </Button>
@@ -210,7 +187,6 @@ export function DashboardPage() {
         )}
       </div>
 
-      {/* Table */}
       <div className="flex-1 overflow-auto p-8">
         {isLoading ? (
           <div className="flex h-full flex-col items-center justify-center text-center">
@@ -224,15 +200,13 @@ export function DashboardPage() {
             <p className="mt-2 text-muted-foreground">
               {searchQuery || dateFilter || statusFilter !== "all"
                 ? "Try adjusting your filters"
-                : "Sync your Shopee account to import orders"}
+                : "Connect a supported marketplace and synchronize orders"}
             </p>
           </div>
         ) : (
           <div className="rounded-lg border border-border bg-card">
             <div className="p-4 border-b border-border">
-              <p className="text-sm text-muted-foreground">
-                Total: {filteredOrders.length} order(s)
-              </p>
+              <p className="text-sm text-muted-foreground">Total: {filteredOrders.length} order(s)</p>
             </div>
             <Table>
               <TableHeader>
@@ -252,7 +226,7 @@ export function DashboardPage() {
               </TableHeader>
               <TableBody>
                 {filteredOrders.map((order) => (
-                  <TableRow key={order.id}>
+                  <TableRow key={order.databaseId}>
                     <TableCell>
                       <Checkbox
                         checked={selectedOrders.has(order.id)}
@@ -264,7 +238,7 @@ export function DashboardPage() {
                     <TableCell>{order.customer}</TableCell>
                     <TableCell>฿{order.amount.toLocaleString()}</TableCell>
                     <TableCell>
-                      <Badge className={statusColors[order.status as keyof typeof statusColors]}>
+                      <Badge className={statusClassName(order.status)}>
                         {order.status.charAt(0).toUpperCase() + order.status.slice(1)}
                       </Badge>
                     </TableCell>
