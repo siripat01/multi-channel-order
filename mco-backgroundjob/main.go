@@ -18,12 +18,21 @@ func main() {
 		log.Fatal("SHOPEE_BASE_URL must be set")
 	}
 
-	databaseClient, err := internal.NewSupabaseClient()
-	if err != nil {
-		log.Fatalf("initialize database client: %v", err)
+	supabaseURL := os.Getenv("SUPABASE_URL")
+	supabaseKey := os.Getenv("SUPABASE_SERVICE_ROLE_KEY")
+	if supabaseKey == "" {
+		// Backward-compatible fallback while existing local environments migrate.
+		supabaseKey = os.Getenv("SUPABASE_KEY")
+	}
+	if supabaseURL == "" || supabaseKey == "" {
+		log.Fatal("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set")
 	}
 
-	repository, err := NewSupabaseOrderRepository(databaseClient)
+	repository, err := NewSupabaseOrderRepository(
+		supabaseURL,
+		supabaseKey,
+		&http.Client{Timeout: 10 * time.Second},
+	)
 	if err != nil {
 		log.Fatalf("initialize order repository: %v", err)
 	}

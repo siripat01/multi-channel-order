@@ -2,9 +2,9 @@
 
 A backend-focused order management system that normalizes marketplace orders into one internal model and processes synchronization asynchronously with Redis/Asynq.
 
-The current engineering focus is on practical concerns such as provider boundaries, retry safety, idempotency, HTTP reliability, testing, and database consistency.
+The current engineering focus is on provider boundaries, retry safety, idempotency, HTTP reliability, testing, and database consistency.
 
-> **Current status:** Shopee synchronization is the only implemented worker adapter. Lazada and LINE Shopping are currently UI/product placeholders, not working integrations. The original Bun backend source also needs to be restored because `mco-backend/app` was accidentally committed as an unresolved Git gitlink.
+> **Current status:** Shopee synchronization is the only implemented worker adapter. Lazada and LINE Shopping are UI/product placeholders, not working integrations. The original Bun backend source also needs to be restored because `mco-backend/app` was accidentally committed as an unresolved Git gitlink.
 
 ## Features
 
@@ -15,8 +15,9 @@ The current engineering focus is on practical concerns such as provider boundari
 - Provider abstraction separating marketplace-specific payloads from core sync logic
 - Normalized internal order and order-item models
 - Deterministic local order identifiers for retry safety
-- PostgreSQL uniqueness constraints + PostgREST upserts for idempotent synchronization
-- Context-aware provider HTTP requests with timeouts and non-2xx handling
+- PostgreSQL uniqueness constraints for idempotent synchronization
+- Atomic order + item persistence through a PostgreSQL RPC
+- Context-aware HTTP requests with timeouts and non-2xx handling
 - Structured worker logging
 - Docker Compose local runtime
 - Unit tests using fake repositories and `httptest.Server`
@@ -32,7 +33,8 @@ flowchart LR
     QUEUE --> WORKER[Go Sync Worker]
     WORKER --> ADAPTER[OrderProvider Adapter]
     ADAPTER --> SHOPEE[Shopee API / Mock]
-    WORKER --> DB
+    WORKER --> RPC[Atomic persistence RPC]
+    RPC --> DB
 
     LAZADA[Lazada - not implemented] -. future adapter .-> ADAPTER
     LINE[LINE Shopping - not implemented] -. future adapter .-> ADAPTER
@@ -49,7 +51,7 @@ Detailed engineering decisions are documented in [`docs/architecture.md`](docs/a
 | Background processing | Go, Asynq |
 | Queue | Redis |
 | Database | Supabase / PostgreSQL |
-| Provider HTTP | Go `net/http` |
+| Provider and persistence HTTP | Go `net/http` |
 | Local runtime | Docker Compose |
 
 ## Project Structure
@@ -61,9 +63,8 @@ Detailed engineering decisions are documented in [`docs/architecture.md`](docs/a
 │   ├── domain.go            # normalized order model + deterministic IDs
 │   ├── provider.go          # provider interface
 │   ├── shopee_provider.go   # Shopee-specific HTTP adapter
-│   ├── handler.go           # Asynq orchestration only
-│   ├── repository.go        # persistence boundary
-│   └── internal/            # infrastructure configuration
+│   ├── handler.go           # Asynq orchestration
+│   └── repository.go        # atomic persistence boundary
 ├── mco-frontend/frontend/   # React dashboard
 ├── docs/
 │   ├── architecture.md
@@ -78,8 +79,9 @@ Detailed engineering decisions are documented in [`docs/architecture.md`](docs/a
 3. The provider adapter lists external order IDs and fetches order details.
 4. Provider-specific payloads are normalized into internal `ExternalOrder`, `Order`, and `OrderItem` models.
 5. Local order IDs are deterministically derived from `(shop_id, channel, external_order_id)`.
-6. The repository upserts orders and items using database uniqueness constraints.
-7. Retrying the same logical sync targets the same rows rather than creating new logical orders.
+6. The repository sends one RPC request containing the order batch and items.
+7. PostgreSQL upserts orders and items in one transaction.
+8. Retrying the same logical sync targets the same rows rather than creating duplicates.
 
 ## Reliability Decisions
 
@@ -89,23 +91,24 @@ Shopee JSON models and HTTP endpoints live inside the Shopee adapter. The task h
 
 ### Retry-safe identity
 
-Asynq jobs can run more than once. The worker therefore does not use a fresh random order UUID for every attempt. It derives a stable UUID from the external identity and relies on database unique constraints as the final guard.
+Asynq jobs can run more than once. The worker derives a stable UUID from `(shop_id, channel, external_order_id)` and relies on PostgreSQL unique constraints as the final guard.
 
-Apply:
+### Atomic persistence
+
+Apply these migrations in order:
 
 ```text
 docs/sql/001_order_sync_idempotency.sql
+docs/sql/002_atomic_order_sync.sql
 ```
 
-before using the refactored persistence path.
+`persist_synced_orders` runs the order and order-item upserts inside one PostgreSQL function call. If any statement fails, PostgreSQL aborts the function transaction, preventing a persisted order without its items.
+
+The RPC is restricted to the Supabase `service_role`; the key must remain in the trusted worker environment.
 
 ### HTTP failure handling
 
-Provider calls use an injected `http.Client` with a timeout, `context.Context`, non-2xx checks, and contextual errors. Tests can replace the real provider with `httptest.Server`.
-
-### Transaction boundary
-
-Order and order-item upserts are currently separate PostgREST requests. They are idempotent at the row level but **not yet one atomic transaction**. This is documented technical debt. See [`docs/architecture.md`](docs/architecture.md) for the recommended transaction options.
+Provider and persistence requests use injected `http.Client` instances with timeouts and `context.Context`. Non-2xx responses become contextual errors. Provider and repository behavior can both be tested with `httptest.Server`.
 
 ## Local Development
 
@@ -122,18 +125,19 @@ Set:
 ```text
 REDIS_ADDR
 SUPABASE_URL
-SUPABASE_KEY
+SUPABASE_SERVICE_ROLE_KEY
 SHOPEE_BASE_URL
 ```
 
-`SHOPEE_BASE_URL` may point to a mock server during development.
+`SHOPEE_BASE_URL` may point to a mock server during development. `SUPABASE_SERVICE_ROLE_KEY` must never be exposed to frontend code.
 
-### Database migration
+### Database migrations
 
-Apply the idempotency migration to the development database:
+Apply:
 
 ```text
 docs/sql/001_order_sync_idempotency.sql
+docs/sql/002_atomic_order_sync.sql
 ```
 
 ### Start local services
@@ -150,7 +154,7 @@ go test ./...
 go vet ./...
 ```
 
-Tests cover retry-safe identity, payload validation, Shopee response normalization, and provider HTTP failures without calling a real marketplace API.
+Tests cover retry-safe identity, payload validation, Shopee response normalization, provider HTTP failures, repository RPC behavior, authentication headers, non-2xx persistence failures, and context cancellation without calling real marketplace or Supabase endpoints.
 
 ## Known Repository Issue
 
@@ -166,18 +170,16 @@ This likely happened because the backend directory had its own `.git` directory 
 - Lazada and LINE Shopping are not implemented integrations yet.
 - Some frontend bulk actions remain UI-only until the Bun backend source is restored and the status API can be implemented safely.
 - Label generation is still incomplete/demo behavior.
-- Order + order-item persistence is retry-safe but not yet atomic across both writes.
-- No database integration test currently proves the PostgreSQL upsert constraints end-to-end.
+- A real database integration test is still needed to execute the migration/RPC against PostgreSQL end-to-end.
 
 ## Future Improvements
 
 1. Recover the original Bun backend source into the monorepo.
 2. Implement and validate `NEW -> PACKED -> SHIPPED` on the backend.
 3. Connect frontend bulk status actions to that API.
-4. Move order + item persistence into one PostgreSQL transaction/RPC.
-5. Add a database integration test for duplicate sync and transaction rollback.
-6. Add real Lazada/LINE provider adapters only when there is a real integration target.
+4. Add a database integration test for duplicate sync and transaction rollback.
+5. Add real Lazada/LINE provider adapters only when there is a real integration target.
 
 ## Design Scope
 
-The repository intentionally favors understandable engineering over unnecessary infrastructure. It uses a small number of explicit boundaries—provider, task handler, and repository—to support asynchronous processing, external API integration, idempotency, testability, and reliability without adding systems the current workload does not require.
+The repository favors understandable engineering over unnecessary infrastructure. It uses a small number of explicit boundaries—provider, task handler, and repository—to support asynchronous processing, external API integration, idempotency, testability, and reliability without adding systems the current workload does not require.
