@@ -86,7 +86,7 @@ A failure between order upsert and item upsert can still leave a temporarily par
 1. a PostgreSQL function/RPC that persists an order and its items in one transaction, or
 2. a direct PostgreSQL repository using a transaction.
 
-This is intentionally documented as remaining technical debt instead of pretending the current REST calls are transactional.
+This is intentionally documented as remaining technical debt instead of treating the current REST calls as transactional.
 
 ## Order status workflow
 
@@ -151,4 +151,4 @@ The frontend, API, and worker are separate runtime processes, but the repository
 
 ### Supabase/PostgREST retained
 
-The project already uses Supabase, so the current hardening keeps it instead of replacing the database layer purely for portfolio complexity. A direct PostgreSQL repository is only justified if atomic order/item writes become a priority.
+The project already uses Supabase, so the current design keeps it instead of replacing the database layer without a concrete requirement. A direct PostgreSQL repository is justified only if atomic order/item writes become a priority.

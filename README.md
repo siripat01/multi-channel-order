@@ -1,8 +1,8 @@
 # Multi-Channel Order Management
 
-A backend-focused order management project that normalizes marketplace orders into one internal model and processes synchronization asynchronously with Redis/Asynq.
+A backend-focused order management system that normalizes marketplace orders into one internal model and processes synchronization asynchronously with Redis/Asynq.
 
-The project is being hardened as a Software Engineering portfolio project around practical concerns such as provider boundaries, retry safety, idempotency, HTTP reliability, testing, and database consistency.
+The current engineering focus is on practical concerns such as provider boundaries, retry safety, idempotency, HTTP reliability, testing, and database consistency.
 
 > **Current status:** Shopee synchronization is the only implemented worker adapter. Lazada and LINE Shopping are currently UI/product placeholders, not working integrations. The original Bun backend source also needs to be restored because `mco-backend/app` was accidentally committed as an unresolved Git gitlink.
 
@@ -178,6 +178,6 @@ This likely happened because the backend directory had its own `.git` directory 
 5. Add a database integration test for duplicate sync and transaction rollback.
 6. Add real Lazada/LINE provider adapters only when there is a real integration target.
 
-## Portfolio Focus
+## Design Scope
 
-This repository intentionally favors understandable engineering over unnecessary infrastructure. It uses a small number of explicit boundaries—provider, task handler, and repository—to demonstrate asynchronous processing, external API integration, idempotency, testability, and reliability without introducing Kafka, Kubernetes, CQRS, or microservices only for portfolio value.
+The repository intentionally favors understandable engineering over unnecessary infrastructure. It uses a small number of explicit boundaries—provider, task handler, and repository—to support asynchronous processing, external API integration, idempotency, testability, and reliability without adding systems the current workload does not require.
